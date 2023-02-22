@@ -21,6 +21,8 @@ type ParsedMigration struct {
 
 	DisableTransactionUp   bool
 	DisableTransactionDown bool
+
+	ExclusiveConnection bool
 }
 
 var (

@@ -2,9 +2,11 @@ package migrate
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/go-gorp/gorp/v3"
 	"io"
 	"net/http"
 	"os"
@@ -14,8 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/go-gorp/gorp/v3"
 
 	"github.com/rubenv/sql-migrate/sqlparse"
 )
@@ -129,6 +129,8 @@ type Migration struct {
 
 	DisableTransactionUp   bool
 	DisableTransactionDown bool
+
+	ExclusiveConnection bool
 }
 
 func (m Migration) Less(other *Migration) bool {
@@ -164,8 +166,9 @@ func (m Migration) VersionInt() int64 {
 type PlannedMigration struct {
 	*Migration
 
-	DisableTransaction bool
-	Queries            []string
+	DisableTransaction  bool
+	ExclusiveConnection bool
+	Queries             []string
 }
 
 type byId []*Migration
@@ -414,6 +417,7 @@ func ParseMigration(id string, r io.ReadSeeker) (*Migration, error) {
 
 	m.DisableTransactionUp = parsed.DisableTransactionUp
 	m.DisableTransactionDown = parsed.DisableTransactionDown
+	m.ExclusiveConnection = parsed.ExclusiveConnection
 
 	return m, nil
 }
@@ -473,6 +477,32 @@ func (ms MigrationSet) ExecVersion(db *sql.DB, dialect string, m MigrationSource
 		return 0, err
 	}
 	return ms.applyMigrations(dir, migrations, dbMap)
+}
+
+type singleConn struct {
+	ctx   context.Context
+	dbMap *gorp.DbMap
+}
+
+func (sc singleConn) Exec(query string, args ...interface{}) (sql.Result, error) {
+	conn, err := sc.dbMap.Db.Conn(sc.ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn.ExecContext(sc.ctx, query, args...)
+}
+
+func (sc singleConn) Insert(list ...interface{}) error {
+	_, err := sc.dbMap.Db.Conn(sc.ctx)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+func (sc singleConn) Delete(list ...interface{}) (int64, error) {
+	return 0, nil
 }
 
 // Applies the planned migrations and returns the number of applied migrations.
@@ -647,15 +677,17 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 
 		if dir == Up {
 			result = append(result, &PlannedMigration{
-				Migration:          v,
-				Queries:            v.Up,
-				DisableTransaction: v.DisableTransactionUp,
+				Migration:           v,
+				Queries:             v.Up,
+				DisableTransaction:  v.DisableTransactionUp,
+				ExclusiveConnection: v.ExclusiveConnection,
 			})
 		} else if dir == Down {
 			result = append(result, &PlannedMigration{
-				Migration:          v,
-				Queries:            v.Down,
-				DisableTransaction: v.DisableTransactionDown,
+				Migration:           v,
+				Queries:             v.Down,
+				DisableTransaction:  v.DisableTransactionDown,
+				ExclusiveConnection: v.ExclusiveConnection,
 			})
 		}
 	}
@@ -754,9 +786,10 @@ func ToCatchup(migrations, existingMigrations []*Migration, lastRun *Migration) 
 		}
 		if !found && migration.Less(lastRun) {
 			missing = append(missing, &PlannedMigration{
-				Migration:          migration,
-				Queries:            migration.Up,
-				DisableTransaction: migration.DisableTransactionUp,
+				Migration:           migration,
+				Queries:             migration.Up,
+				DisableTransaction:  migration.DisableTransactionUp,
+				ExclusiveConnection: migration.ExclusiveConnection,
 			})
 		}
 	}
